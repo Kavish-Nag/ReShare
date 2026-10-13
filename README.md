@@ -1,6 +1,6 @@
 # ReShare
 
-### An AWS-Based Surplus Food Marketplace with Secure Authentication, Inventory Management, and Automated Delivery Assignment
+### An AWS-Based Surplus Food Marketplace 
 
 ReShare is a cloud-ready marketplace concept that connects people and businesses with surplus or near-expiry food to buyers looking for affordable options. Sellers can publish listings with quantities, prices, images, pickup details, and expiry information. Buyers can browse available listings and place demo orders, while the platform tracks inventory and supports delivery assignment.
 
