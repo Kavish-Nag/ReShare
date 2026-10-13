@@ -1,0 +1,44 @@
+{
+  "family": "reshare-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "REPLACE_WITH_ECS_TASK_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "REPLACE_WITH_RESHARE_API_TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "reshare-api",
+      "image": "REPLACE_WITH_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/reshare-api:latest",
+      "essential": true,
+      "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+      "environment": [
+        {"name": "NODE_ENV", "value": "production"},
+        {"name": "PORT", "value": "3000"},
+        {"name": "AUTH_MODE", "value": "local"},
+        {"name": "AWS_REGION", "value": "ap-south-1"},
+        {"name": "DB_SSL", "value": "true"},
+        {"name": "DB_POOL_MAX", "value": "5"}
+      ],
+      "secrets": [
+        {"name": "DATABASE_URL", "valueFrom": "REPLACE_WITH_DATABASE_SECRET_ARN"},
+        {"name": "JWT_SECRET", "valueFrom": "REPLACE_WITH_JWT_SECRET_ARN"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/reshare-api",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "api"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      }
+    }
+  ]
+}
