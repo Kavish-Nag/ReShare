@@ -35,7 +35,6 @@ This project demonstrates a full-stack application and cloud computing concepts 
 - PostgreSQL schema for users, listings, orders, order items, deliveries, and audit logs.
 - Transactional inventory updates to reduce overselling risk.
 - Amazon S3 presigned-upload endpoint for listing images.
-- Amazon SQS and AWS Lambda delivery-assignment workflow.
 - Docker and Docker Compose for local development.
 - AWS ECS/Fargate and Application Load Balancer deployment examples.
 - Health and diagnostic endpoints for testing.
