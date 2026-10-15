@@ -1,0 +1,813 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ReShare - VPC, RDS PostgreSQL, ECS Fargate API behind an ALB, S3 + CloudFront,
+  SQS delivery queue, delivery-assignment Lambda, SNS + SES order notifications.
+  Deploy with infra/scripts/deploy-stack.sh (it packages the Lambda code first).
+
+Parameters:
+  ApiImageUri:
+    Type: String
+    Description: ECR image URI for the API (pushed by infra/scripts/build-and-push.sh).
+  SesFromAddress:
+    Type: String
+    Description: Sender email for order notifications. SES emails you a verification link.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  MaxCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email for CloudWatch alarm notifications (AWS sends a confirmation link). Leave empty to skip email.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: reshare-vpc}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+
+  # One NAT gateway keeps cost down; private subnets need it to reach SQS, SNS, Secrets Manager and ECR.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: {AllocationId: !GetAtt NatEip.AllocationId, SubnetId: !Ref PublicSubnetA}
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from the internet (CloudFront connects here)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}]
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API tasks - port 3000 from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSecurityGroup}]
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Delivery-assignment Lambda (outbound only)
+      VpcId: !Ref Vpc
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - PostgreSQL from API tasks and the Lambda only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ApiSecurityGroup}
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref LambdaSecurityGroup}
+
+  # --------------------------------------------------------------- Database
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: ReShare RDS master credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"reshare"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: ReShare private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: '18'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: reshare
+      MasterUsername: reshare
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+  # Adds host/port to the secret so the Lambda can build its connection string from DB_SECRET_ARN.
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: ReShare JWT signing key
+      GenerateSecretString: {PasswordLength: 64, ExcludePunctuation: true}
+
+  # ------------------------------------------------------------- Messaging
+  DeliveryDlq:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600}
+  DeliveryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeliveryDlq.Arn
+        maxReceiveCount: 3
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+
+  SesIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties: {EmailIdentity: !Ref SesFromAddress}
+
+  # ----------------------------------------------------------------- Lambdas
+  # Code points at local folders; `aws cloudformation package` (run by deploy-stack.sh) zips and uploads them.
+  AssignmentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole]
+      Policies:
+        - PolicyName: assignment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes'], Resource: !GetAtt DeliveryQueue.Arn}
+              - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref DbSecret}
+              - {Effect: Allow, Action: 'sns:Publish', Resource: !Ref OrderEventsTopic}
+  AssignmentFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DbSecretAttachment
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt AssignmentRole.Arn
+      Code: ../backend/lambda/delivery-assignment
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DbSecret
+          DB_NAME: reshare
+          DB_SSL: 'true'
+          NODE_EXTRA_CA_CERTS: /var/task/rds-ca.pem
+          SNS_ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic
+  AssignmentLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AssignmentFunction}', RetentionInDays: 14}
+  AssignmentTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref AssignmentFunction
+      EventSourceArn: !GetAtt DeliveryQueue.Arn
+      BatchSize: 5
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: send-email
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: 'ses:SendEmail', Resource: '*'}]
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 15
+      Role: !GetAtt NotifierRole.Arn
+      Code: ../backend/lambda/order-notifier
+      Environment:
+        Variables:
+          SES_FROM_ADDRESS: !Ref SesFromAddress
+  NotifierPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref OrderEventsTopic
+  NotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt NotifierFunction.Arn
+
+  # --------------------------------------------------------- Storage + CDN
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      # Browsers PUT straight to S3 using a 5-minute presigned URL, which is the real access control.
+      # Origin is '*' because the CloudFront domain is not known until after this bucket exists.
+      CorsConfiguration:
+        CorsRules: [{AllowedMethods: [PUT], AllowedOrigins: ['*'], AllowedHeaders: ['*'], MaxAge: 3000}]
+      LifecycleConfiguration:
+        Rules: [{Status: Enabled, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}}]
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - Id: images
+            DomainName: !GetAtt ImagesBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - Id: api
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig: {OriginProtocolPolicy: http-only, HTTPPort: 80}
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # CachingOptimized
+        CacheBehaviors:
+          # Same domain for site and API, so the browser sees one HTTPS origin (no mixed content, no CORS).
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+          - PathPattern: /listings/*
+            TargetOriginId: images
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition: {StringEquals: {'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'}}
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImagesBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${ImagesBucket.Arn}/listings/*'
+            Condition: {StringEquals: {'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'}}
+
+  # --------------------------------------------------------- ALB + ECS API
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes: [{Key: deregistration_delay.timeout_seconds, Value: '30'}]
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /ecs/reshare-api, RetentionInDays: 14}
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: [!Ref DbSecret, !Ref JwtSecret]}]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['s3:PutObject', 's3:GetObject', 's3:DeleteObject'], Resource: !Sub '${ImagesBucket.Arn}/listings/*'}
+              - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt DeliveryQueue.Arn}
+              - {Effect: Allow, Action: 'sns:Publish', Resource: !Ref OrderEventsTopic}
+              - {Effect: Allow, Action: 'rekognition:DetectLabels', Resource: '*'}
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: reshare-api
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: reshare-api
+          Image: !Ref ApiImageUri
+          Essential: true
+          PortMappings: [{ContainerPort: 3000}]
+          Environment:
+            - {Name: NODE_ENV, Value: production}
+            - {Name: PORT, Value: '3000'}
+            - {Name: AUTH_MODE, Value: local}
+            - {Name: AWS_REGION, Value: !Ref 'AWS::Region'}
+            - {Name: DB_SSL, Value: 'true'}
+            - {Name: TRUST_PROXY_HOPS, Value: '2'}
+            - {Name: DB_POOL_MAX, Value: '5'}
+            - {Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address}
+            - {Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port}
+            - {Name: DB_NAME, Value: reshare}
+            - {Name: DB_USER, Value: reshare}
+            - {Name: S3_BUCKET, Value: !Ref ImagesBucket}
+            - {Name: S3_PUBLIC_BASE_URL, Value: !Sub 'https://${Distribution.DomainName}'}
+            - {Name: ALLOWED_ORIGINS, Value: !Sub 'https://${Distribution.DomainName}'}
+            - {Name: SQS_DELIVERY_QUEUE_URL, Value: !Ref DeliveryQueue}
+            - {Name: SNS_ORDER_EVENTS_TOPIC_ARN, Value: !Ref OrderEventsTopic}
+          Secrets:
+            - {Name: DB_PASSWORD, ValueFrom: !Sub '${DbSecret}:password::'}
+            - {Name: JWT_SECRET, ValueFrom: !Ref JwtSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogs
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: api
+          HealthCheck:
+            Command: ['CMD-SHELL', "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref ApiSecurityGroup]
+      LoadBalancers:
+        - {ContainerName: reshare-api, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroup}
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: !Ref MaxCount
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cpu-55
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 55
+        PredefinedMetricSpecification: {PredefinedMetricType: ECSServiceAverageCPUUtilization}
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Delivery assignment messages are failing (check the admin pending list)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt DeliveryDlq.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------------------------ WAF
+  # Regional web ACL on the ALB (a CloudFront-scoped ACL must live in us-east-1, i.e. a second stack).
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-waf'
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: !Sub '${AWS::StackName}-waf', SampledRequestsEnabled: true}
+      Rules:
+        - Name: rate-limit-per-ip
+          Priority: 0
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              EvaluationWindowSec: 300
+              AggregateKeyType: FORWARDED_IP
+              # shortcut: the first X-Forwarded-For entry is client-controlled, so a determined attacker can spread
+              # requests across fake IPs. The API's own per-IP limits (rateLimits.js) are the precise control.
+              ForwardedIPConfig: {HeaderName: X-Forwarded-For, FallbackBehavior: MATCH}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: rate-limit-per-ip, SampledRequestsEnabled: true}
+        - Name: ip-reputation
+          Priority: 1
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: ip-reputation, SampledRequestsEnabled: true}
+        - Name: known-bad-inputs
+          Priority: 2
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: known-bad-inputs, SampledRequestsEnabled: true}
+        - Name: common-rules
+          Priority: 3
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              # Seller photos (up to 5 MB) are POSTed to /api/products/identify; the default 8 KB body limit would block them.
+              RuleActionOverrides: [{Name: SizeRestrictions_BODY, ActionToUse: {Count: {}}}]
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, MetricName: common-rules, SampledRequestsEnabled: true}
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # -------------------------------------------------------------- CloudTrail
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      LifecycleConfiguration:
+        Rules: [{Status: Enabled, ExpirationInDays: 90}]
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition: {StringEquals: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail'}}
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub '${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail'
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-trail'
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+
+  # --------------------------------------------------------------- Alarms
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties: {TopicArn: !Ref AlarmTopic, Protocol: email, Endpoint: !Ref AlarmEmail}
+
+  ApiCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API tasks are running hot (autoscaling adds tasks up to MaxCount)
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions: [{Name: ClusterName, Value: !Ref Cluster}, {Name: ServiceName, Value: !GetAtt Service.Name}]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  ApiMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API tasks are running out of memory
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Dimensions: [{Name: ClusterName, Value: !Ref Cluster}, {Name: ServiceName, Value: !GetAtt Service.Name}]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The API is returning server errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  ApiSlowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 95th percentile API response time is over 2 seconds
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  UnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A load balancer target is failing its health check
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions: [{Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}, {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU is high
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref Database}]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database has under 2 GB of free storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref Database}]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  AssignmentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The delivery-assignment Lambda is failing
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref AssignmentFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  NotifierErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The email notifier Lambda is failing
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref NotifierFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  WafBlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: WAF is blocking an unusual number of requests (possible attack)
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions: [{Name: WebACL, Value: !Sub '${AWS::StackName}-waf'}, {Name: Region, Value: !Ref 'AWS::Region'}, {Name: Rule, Value: ALL}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-overview'
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests and errors","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${LoadBalancer.LoadBalancerFullName}"],[".","HTTPCode_Target_5XX_Count",".","."],[".","HTTPCode_Target_4XX_Count",".","."]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Response time (p95)","region":"${AWS::Region}","stat":"p95","period":300,
+            "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${LoadBalancer.LoadBalancerFullName}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"API tasks: CPU and memory","region":"${AWS::Region}","stat":"Average","period":300,
+            "metrics":[["AWS/ECS","CPUUtilization","ClusterName","${Cluster}","ServiceName","${Service.Name}"],[".","MemoryUtilization",".",".",".","."]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Database","region":"${AWS::Region}","stat":"Average","period":300,
+            "metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Database}"],[".","DatabaseConnections",".","."]]}},
+          {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Delivery queue","region":"${AWS::Region}","stat":"Maximum","period":300,
+            "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${DeliveryQueue.QueueName}"],[".",".",".","${DeliveryDlq.QueueName}"]]}},
+          {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"WAF blocked requests","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["AWS/WAFV2","BlockedRequests","WebACL","${AWS::StackName}-waf","Region","${AWS::Region}","Rule","ALL"]]}}
+        ]}
+Outputs:
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-overview'
+  TrailBucket:
+    Value: !Ref TrailBucket
+  SiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  FrontendBucket:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  ClusterName:
+    Value: !Ref Cluster
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  PrivateSubnets:
+    Value: !Sub '${PrivateSubnetA},${PrivateSubnetB}'
+  ApiSecurityGroupId:
+    Value: !Ref ApiSecurityGroup

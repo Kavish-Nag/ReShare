@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../config/database.js';
 import { authenticate, requireRole } from '../middleware/verifyJwt.js';
+import { notifyBuyer } from '../services/events.js';
 
 const router = Router();
 
@@ -52,6 +53,7 @@ router.patch('/:id/status', authenticate, requireRole('delivery','admin'), async
         : parsed.data.status === 'PICKED_UP' ? 'PICKED_UP' : 'DELIVERED';
       await client.query('UPDATE orders SET order_status=$1 WHERE id=$2', [orderStatus, delivery.order_id]);
       await client.query('COMMIT');
+      if (orderStatus !== 'ASSIGNED') await notifyBuyer(delivery.order_id, orderStatus === 'DELIVERED' ? 'DELIVERED' : 'PICKED_UP');
       res.json({ delivery: updated.rows[0] });
     } catch (e) {
       await client.query('ROLLBACK');

@@ -23,8 +23,7 @@ router.post('/presign', authenticate, requireRole('seller','admin'), async (req,
     const command = new PutObjectCommand({
       Bucket: process.env.S3_BUCKET,
       Key: key,
-      ContentType: parsed.data.contentType,
-      Metadata: { uploader: req.user.id }
+      ContentType: parsed.data.contentType
     });
     const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
     const imageUrl = process.env.S3_PUBLIC_BASE_URL

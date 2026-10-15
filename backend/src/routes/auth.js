@@ -4,12 +4,14 @@ import { SignJWT } from 'jose';
 import { pool } from '../config/database.js';
 import { authenticate } from '../middleware/verifyJwt.js';
 import { hashPassword, verifyPassword } from '../services/passwords.js';
+import { passwordProblem, MIN_PASSWORD_LENGTH } from '../services/passwordPolicy.js';
+import { loginLimiter, registerLimiter } from '../middleware/rateLimits.js';
 
 const router = Router();
 const registerSchema = z.object({
   name: z.string().trim().min(2).max(100),
   email: z.string().trim().email().max(255),
-  password: z.string().min(8).max(128),
+  password: z.string().min(10).max(128),
   role: z.enum(['buyer', 'seller'])
 });
 const loginSchema = z.object({
@@ -17,6 +19,23 @@ const loginSchema = z.object({
   password: z.string().min(1).max(128),
   portal: z.enum(['user', 'admin']).optional().default('user')
 });
+
+const MAX_FAILURES = 5;
+const logAuth = (action, email, actorId, ip) => pool.query(
+  `INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,details) VALUES($1,$2,'login',$3,$4::jsonb)`,
+  [actorId, action, email, JSON.stringify({ ip })]
+);
+// Failed sign-ins for this email in the last 15 minutes, counted from the last successful sign-in. Stored in the
+// database (not memory) so the lockout holds across every API task.
+async function recentFailures(email) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM audit_logs
+     WHERE action='LOGIN_FAILED' AND entity_id=$1 AND created_at > NOW() - INTERVAL '15 minutes'
+       AND created_at > COALESCE((SELECT MAX(created_at) FROM audit_logs WHERE action='LOGIN_SUCCESS' AND entity_id=$1), '-infinity')`,
+    [email]
+  );
+  return rows[0].n;
+}
 
 function ensureLocalAuth(res) {
   if (process.env.AUTH_MODE !== 'local') {
@@ -53,11 +72,13 @@ async function issueToken(user) {
     .sign(key);
 }
 
-router.post('/register', async (req, res, next) => {
+router.post('/register', registerLimiter, async (req, res, next) => {
   if (!ensureLocalAuth(res)) return;
   const parsed = registerSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Enter a valid name, email, password (at least 8 characters), and buyer/seller role.', details: parsed.error.flatten() });
+  if (!parsed.success) return res.status(400).json({ error: `Enter a valid name, email, password (at least ${MIN_PASSWORD_LENGTH} characters), and buyer/seller role.`, details: parsed.error.flatten() });
   const data = parsed.data;
+  const weak = passwordProblem(data.password, data.email);
+  if (weak) return res.status(400).json({ error: weak });
   try {
     const passwordHash = await hashPassword(data.password);
     const result = await pool.query(
@@ -75,17 +96,22 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
-router.post('/login', async (req, res, next) => {
+router.post('/login', loginLimiter, async (req, res, next) => {
   if (!ensureLocalAuth(res)) return;
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Enter a valid email and password.' });
   const { email, password, portal } = parsed.data;
+  const key = email.toLowerCase();
   try {
+    if (await recentFailures(key) >= MAX_FAILURES) {
+      return res.status(429).json({ error: 'Too many failed sign-in attempts. Try again in 15 minutes.' });
+    }
     const result = await pool.query(
       `SELECT id,name,email,password_hash,role,status,service_area,availability_status
        FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]
     );
     if (!result.rowCount || result.rows[0].status !== 'ACTIVE' || !(await verifyPassword(password, result.rows[0].password_hash))) {
+      await logAuth('LOGIN_FAILED', key, null, req.ip);
       return res.status(401).json({ error: 'Incorrect email or password.' });
     }
     const row = result.rows[0];
@@ -95,6 +121,7 @@ router.post('/login', async (req, res, next) => {
     if (portal === 'user' && row.role === 'admin') {
       return res.status(403).json({ error: 'Use the dedicated administrator sign-in for this account.' });
     }
+    await logAuth('LOGIN_SUCCESS', key, row.id, req.ip);
     const token = await issueToken(row);
     res.json({ token, user: publicUser(row) });
   } catch (error) { next(error); }

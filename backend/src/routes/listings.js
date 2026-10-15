@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../config/database.js';
 import { authenticate, requireRole } from '../middleware/verifyJwt.js';
+import { verifyListingImage } from '../services/imageCheck.js';
 
 const router = Router();
 const listingSchema = z.object({
@@ -81,6 +82,7 @@ router.post('/', authenticate, requireRole('seller', 'admin'), async (req, res, 
     const parsed = listingSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'Invalid listing data', details: parsed.error.flatten() });
     const d = parsed.data;
+    if (d.image_key) d.image_url = await verifyListingImage(d.image_key, req.user.id);
     if (new Date(d.expiry_at) <= new Date()) return res.status(400).json({ error: 'Expiry must be in the future' });
     if (d.original_price_cents != null && d.original_price_cents < d.price_cents) {
       return res.status(400).json({ error: 'Original price cannot be lower than sale price' });
@@ -114,6 +116,7 @@ router.patch('/:id', authenticate, requireRole('seller', 'admin'), async (req, r
     }
     const editable = listingSchema.partial().safeParse(req.body);
     if (!editable.success) return res.status(400).json({ error: 'Invalid listing data', details: editable.error.flatten() });
+    if (editable.data.image_key) editable.data.image_url = await verifyListingImage(editable.data.image_key, req.user.id);
     const allowed = ['title','description','category','image_key','image_url','price_cents','original_price_cents',
       'quantity_available','quantity_unit','expiry_at','prepared_at','storage_conditions','allergens','pickup_address','pickup_area'];
     const entries = Object.entries(editable.data).filter(([k]) => allowed.includes(k));

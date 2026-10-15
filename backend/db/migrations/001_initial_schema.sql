@@ -96,3 +96,6 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   details JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS audit_logs_login_idx ON audit_logs(entity_id, created_at)
+  WHERE action IN ('LOGIN_FAILED','LOGIN_SUCCESS');

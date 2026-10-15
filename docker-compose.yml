@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     environment:
       POSTGRES_DB: reshare
       POSTGRES_USER: reshare
@@ -29,6 +29,10 @@ services:
       ALLOWED_ORIGINS: http://localhost:5173
       S3_BUCKET: ""
       AWS_REGION: ap-south-1
+      # Optional, only for trying photo recognition locally. Use an IAM user allowed rekognition:DetectLabels.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       SQS_DELIVERY_QUEUE_URL: ""
     ports:
       - "3000:3000"

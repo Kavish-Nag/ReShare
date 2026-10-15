@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../config/database.js';
 import { authenticate, requireRole } from '../middleware/verifyJwt.js';
+import { orderLimiter } from '../middleware/rateLimits.js';
 import { enqueueDeliveryAssignment } from '../services/sqs.js';
 
 const router = Router();
@@ -14,7 +15,7 @@ const orderSchema = z.object({
   idempotency_key: z.string().min(8).max(100).optional()
 });
 
-router.post('/', authenticate, requireRole('buyer'), async (req, res, next) => {
+router.post('/', authenticate, requireRole('buyer'), orderLimiter, async (req, res, next) => {
   const parsed = orderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid order', details: parsed.error.flatten() });
 
@@ -132,6 +133,26 @@ router.get('/sales', authenticate, requireRole('seller', 'admin'), async (req, r
        ORDER BY o.created_at DESC LIMIT 100`, [req.user.id]
     );
     res.json({ orders: result.rows });
+  } catch (e) { next(e); }
+});
+
+router.get('/sales/stats', authenticate, requireRole('seller'), async (req, res, next) => {
+  try {
+    const [daily, top] = await Promise.all([
+      pool.query(
+        `SELECT to_char(d::date,'YYYY-MM-DD') AS day, COALESCE(x.units,0)::int AS units, COALESCE(x.revenue_cents,0)::bigint AS revenue_cents
+         FROM generate_series(CURRENT_DATE-13, CURRENT_DATE, '1 day') d
+         LEFT JOIN (
+           SELECT o.created_at::date AS day, SUM(oi.quantity) AS units, SUM(oi.quantity * oi.unit_price_cents) AS revenue_cents
+           FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.seller_id=$1 GROUP BY 1
+         ) x ON x.day=d::date ORDER BY d`, [req.user.id]
+      ),
+      pool.query(
+        `SELECT title_snapshot AS title, SUM(quantity)::int AS units, SUM(quantity * unit_price_cents)::bigint AS revenue_cents
+         FROM order_items WHERE seller_id=$1 GROUP BY title_snapshot ORDER BY revenue_cents DESC LIMIT 5`, [req.user.id]
+      )
+    ]);
+    res.json({ daily: daily.rows, top_listings: top.rows });
   } catch (e) { next(e); }
 });
 

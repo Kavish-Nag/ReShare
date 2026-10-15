@@ -1,8 +1,10 @@
 import pg from 'pg';
+import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
 const { Pool } = pg;
 const secrets = new SecretsManagerClient({ region: process.env.AWS_REGION || 'ap-south-1' });
+const sns = new SNSClient({ region: process.env.AWS_REGION || 'ap-south-1' });
 let poolPromise;
 
 async function getPool() {
@@ -13,7 +15,7 @@ async function getPool() {
       const result = await secrets.send(new GetSecretValueCommand({ SecretId: process.env.DB_SECRET_ARN }));
       const secret = JSON.parse(result.SecretString || '{}');
       connectionString = secret.connectionString ||
-        `postgresql://${encodeURIComponent(secret.username)}:${encodeURIComponent(secret.password)}@${secret.host}:${secret.port || 5432}/${secret.dbname}`;
+        `postgresql://${encodeURIComponent(secret.username)}:${encodeURIComponent(secret.password)}@${secret.host}:${secret.port || 5432}/${secret.dbname || process.env.DB_NAME || 'reshare'}`;
     }
     if (!connectionString) throw new Error('DATABASE_URL or DB_SECRET_ARN is required');
     return new Pool({
@@ -24,6 +26,17 @@ async function getPool() {
     });
   })();
   return poolPromise;
+}
+
+// Email failures must not undo or retry a committed assignment.
+async function notifyBuyer(orderId, buyer) {
+  if (!process.env.SNS_ORDER_EVENTS_TOPIC_ARN || !buyer?.email) return;
+  try {
+    await sns.send(new PublishCommand({
+      TopicArn: process.env.SNS_ORDER_EVENTS_TOPIC_ARN,
+      Message: JSON.stringify({ type: 'DELIVERY_ASSIGNED', orderId, buyerEmail: buyer.email, buyerName: buyer.name })
+    }));
+  } catch (e) { console.error('Could not publish order event:', e.message); }
 }
 
 async function assignOrder(orderId) {
@@ -78,8 +91,12 @@ async function assignOrder(orderId) {
        VALUES('DELIVERY_ASSIGNED','delivery',$1,$2::jsonb)`,
       [delivery.id, JSON.stringify({ order_id: orderId, partner_id: partnerId })]
     );
+    const buyer = await client.query(
+      `SELECT u.email, u.name FROM orders o JOIN users u ON u.id=o.buyer_id WHERE o.id=$1`, [orderId]
+    );
     await client.query('COMMIT');
     console.log(`Assigned order ${orderId} to partner ${partnerId}`);
+    await notifyBuyer(orderId, buyer.rows[0]);
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch {}
     throw e;

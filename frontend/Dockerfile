@@ -1,10 +1,10 @@
-FROM node:20-alpine AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
 ARG VITE_API_BASE_URL=http://localhost:3000
-ARG VITE_AUTH_MODE=demo
+ARG VITE_AUTH_MODE=local
 ARG VITE_COGNITO_REGION=
 ARG VITE_COGNITO_USER_POOL_ID=
 ARG VITE_COGNITO_CLIENT_ID=
